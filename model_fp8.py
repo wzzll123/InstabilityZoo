@@ -14,6 +14,8 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import transformer_engine.pytorch as te
+from functools import partial
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -26,110 +28,6 @@ class LayerNorm(nn.Module):
     def forward(self, input):
         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
 
-class CausalSelfAttention(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        assert config.n_embd % config.n_head == 0
-        # key, query, value projections for all heads, but in a batch
-        self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
-        # output projection
-        self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        # regularization
-        self.attn_dropout = nn.Dropout(config.dropout)
-        self.resid_dropout = nn.Dropout(config.dropout)
-        self.n_head = config.n_head
-        self.n_embd = config.n_embd
-        self.dropout = config.dropout
-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
-        if not self.flash:
-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-        self.log_max_logits = False
-        self.max_attention_logit = None
-        self.min_attention_logits = None
-        self.mean_attention_logits = None
-        self.entropy = None
-        self.entropy_min = None
-
-    def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
-
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
-            if self.log_max_logits:
-                with torch.no_grad():
-                    att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-
-                    att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-                    finite_mask = torch.isfinite(att)
-                    self.max_attention_logit = att[finite_mask].max() # Store the max logit
-                    self.min_attention_logits = att[finite_mask].min()
-                    self.mean_attention_logits = att[finite_mask].mean()
-                
-
-                    att = F.softmax(att, dim=-1)
-                    entropy_tmp = -torch.nansum(att*torch.log(att), dim=-1)
-                    self.entropy = torch.mean(entropy_tmp)
-                    self.entropy_min = torch.min(entropy_tmp)
-        else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
-
-        # output projection
-        y = self.resid_dropout(self.c_proj(y))
-        # # Perform all-reduce on max_attention_logit across all GPUs
-        # if self.max_attention_logit is not None:
-        #     # Apply all-reduce to get the global max across all GPUs
-        #     torch.distributed.all_reduce(self.max_attention_logit, op=torch.distributed.ReduceOp.MAX)
-        return y
-
-class MLP(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.c_fc    = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu    = nn.GELU()
-        self.c_proj  = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def forward(self, x):
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.c_proj(x)
-        x = self.dropout(x)
-        return x
-
-class Block(nn.Module):
-
-    def __init__(self, config):
-        super().__init__()
-        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
-        self.attn = CausalSelfAttention(config)
-        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
-        self.mlp = MLP(config)
-
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
-        x = x + self.mlp(self.ln_2(x))
-        return x
-
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -139,6 +37,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    last_linear_fp8: bool = False
+
 
 class GPT(nn.Module):
 
@@ -148,25 +48,48 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
-        self.transformer = nn.ModuleDict(dict(
-            wte = nn.Embedding(config.vocab_size, config.n_embd),
-            wpe = nn.Embedding(config.block_size, config.n_embd),
-            drop = nn.Dropout(config.dropout),
-            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
-            ln_f = LayerNorm(config.n_embd, bias=config.bias),
-        ))
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # with weight tying when using torch.compile() some warnings get generated:
-        # "UserWarning: functional_call was passed multiple values for tied weights.
-        # This behavior is deprecated and will be an error in future versions"
-        # not 100% sure what this is, so far seems to be harmless. TODO investigate
-        self.transformer.wte.weight = self.lm_head.weight # https://paperswithcode.com/method/weight-tying
+        if not self.config.last_linear_fp8:
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([te.TransformerLayer(config.n_embd, 4*config.n_embd,
+                                                    config.n_head, hidden_dropout=config.dropout,
+                                                    attention_dropout=config.dropout,bias=config.bias,attn_input_format='bshd',
+                                                    fuse_qkv_params=True, init_method=partial(torch.nn.init.normal_, mean=0.0, std=0.02),
+                                                    output_layer_init_method=partial(torch.nn.init.normal_, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))) for _ in range(config.n_layer)]),
+                # with weight tying when using torch.compile() some warnings get generated:
+                # "UserWarning: functional_call was passed multiple values for tied weights.
+                # This behavior is deprecated and will be an error in future versions"
+                # not 100% sure what this is, so far seems to be harmless. TODO investigate
+                ln_f = LayerNorm(config.n_embd, bias=config.bias),
+            ))
+            self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+            self.transformer.wte.weight = self.lm_head.weight
+        else:
+            self.transformer = nn.ModuleDict(dict(
+                wte = nn.Embedding(config.vocab_size, config.n_embd),
+                wpe = nn.Embedding(config.block_size, config.n_embd),
+                drop = nn.Dropout(config.dropout),
+                h = nn.ModuleList([te.TransformerLayer(config.n_embd, 4*config.n_embd,
+                                                    config.n_head, hidden_dropout=config.dropout,
+                                                    attention_dropout=config.dropout,bias=config.bias,attn_input_format='bshd',
+                                                    fuse_qkv_params=True, init_method=partial(torch.nn.init.normal_, mean=0.0, std=0.02),
+                                                    output_layer_init_method=partial(torch.nn.init.normal_, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))) for _ in range(config.n_layer)]),
+            ))
+            self.output_layer_linear = te.LayerNormLinear(config.n_embd, config.vocab_size,bias=config.bias, init_method=partial(torch.nn.init.normal_, mean=0.0, std=0.02))
+            self.transformer.wte.weight = self.output_layer_linear.weight
+
+
+        
+        #  # https://paperswithcode.com/method/weight-tying
 
         # init all weights
         self.apply(self._init_weights)
         # apply special scaled init to the residual projections, per GPT-2 paper
         for pn, p in self.named_parameters():
-            if pn.endswith('c_proj.weight'):
+            # if pn.endswith('c_proj.weight'):
+            if pn.endswith('c_proj.weight') or pn.endswith('fc2_weight') or pn.endswith('self_attention.proj.weight'):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters
@@ -211,7 +134,7 @@ class GPT(nn.Module):
         loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction='none') 
         return loss.view(b,t)     
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, targets=None, is_first_microbatch=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
@@ -221,15 +144,22 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        extra_fwd_args = {"is_first_microbatch": is_first_microbatch}
         for block in self.transformer.h:
-            x = block(x)
-        x = self.transformer.ln_f(x)
+            x = block(x, **extra_fwd_args)
+        
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
-            logits = self.lm_head(x)
+            if self.config.last_linear_fp8:
+                logits = self.output_layer_linear(x)
+            else:
+                x = self.transformer.ln_f(x)
+                logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        ## todo: see what will change
         else:
+            x = self.transformer.ln_f(x)
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
             loss = None
@@ -303,43 +233,6 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-    def configure_sam_optimizers(self, weight_decay, learning_rate, device_type, 
-                                 momentum, is_sam=False, rho=2.0, adaptive=False):
-        # Start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # Filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # Create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        
-        # Create SGD optimizer and use the fused version if available
-        fused_available = 'fused' in inspect.signature(torch.optim.SGD).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        if is_sam:
-            import SAM
-            optimizer = SAM(optim_groups, torch.optim.SGD, rho=rho, adaptive=adaptive, lr=learning_rate, momentum=momentum)
-        else:
-            optimizer = torch.optim.SGD(
-                optim_groups, 
-                lr=learning_rate, 
-                momentum=momentum, 
-                **extra_args
-            )
-        print(f"using fused SGD: {use_fused}")
-
-        return optimizer
-
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
         # start with all of the candidate parameters
@@ -409,4 +302,3 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
-
