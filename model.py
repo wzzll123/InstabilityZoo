@@ -82,7 +82,6 @@ class CausalSelfAttention(nn.Module):
                     att = F.softmax(att, dim=-1)
                     entropy_tmp = -torch.nansum(att*torch.log(att), dim=-1)
                     self.entropy = torch.mean(entropy_tmp)
-                    self.entropy_min = torch.min(entropy_tmp)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -303,42 +302,6 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k])
 
         return model
-    def configure_sam_optimizers(self, weight_decay, learning_rate, device_type, 
-                                 momentum, is_sam=False, rho=2.0, adaptive=False):
-        # Start with all of the candidate parameters
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        # Filter out those that do not require grad
-        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad}
-        # Create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
-        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
-        optim_groups = [
-            {'params': decay_params, 'weight_decay': weight_decay},
-            {'params': nodecay_params, 'weight_decay': 0.0}
-        ]
-        num_decay_params = sum(p.numel() for p in decay_params)
-        num_nodecay_params = sum(p.numel() for p in nodecay_params)
-        print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
-        print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
-        
-        # Create SGD optimizer and use the fused version if available
-        fused_available = 'fused' in inspect.signature(torch.optim.SGD).parameters
-        use_fused = fused_available and device_type == 'cuda'
-        extra_args = dict(fused=True) if use_fused else dict()
-        if is_sam:
-            import SAM
-            optimizer = SAM(optim_groups, torch.optim.SGD, rho=rho, adaptive=adaptive, lr=learning_rate, momentum=momentum)
-        else:
-            optimizer = torch.optim.SGD(
-                optim_groups, 
-                lr=learning_rate, 
-                momentum=momentum, 
-                **extra_args
-            )
-        print(f"using fused SGD: {use_fused}")
-
-        return optimizer
 
 
     def configure_optimizers(self, weight_decay, learning_rate, betas, device_type):
