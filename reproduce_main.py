@@ -11,8 +11,18 @@ def load_config(config_path):
 def build_command(args, config):
     json_model_to_config_file = {'GPT2-S':'gpt2_small', 'GPT2-M':'gpt2_medium', 'GPT2-L':'gpt2_large', 'GPT2-XL':'gpt2_xl'}
     config_file_model = json_model_to_config_file[config['model']]
+    if config['data_type'] == 'BF16':
+        executed_code = "reproduce_instability.py"
+    elif config['data_type'] == 'FP8_with_FP8_head':
+        executed_code = "reproduce_instability_fp8.py"
+        fp8_head = 'True'
+    else:
+        executed_code = "reproduce_instability_fp8.py"
+        fp8_head = 'False'
+
+
     base_cmd = [
-        "torchrun", "--standalone", f"--nproc_per_node={args.nproc}", "reproduce_instability.py",
+        "torchrun", "--standalone", f"--nproc_per_node={args.nproc}", executed_code,
         f"config/reproduce_{config_file_model}.py",
         f"--ckpt_path={args.checkpoint}",
         f'--indices_path={args.index_file}',
@@ -23,6 +33,9 @@ def build_command(args, config):
         f"--start_idx={args.start_idx}",
         f"--max_iters={args.end_idx}",
     ]
+    if config['data_type'] != 'BF16':
+        base_cmd.append(f"--last_linear_fp8={fp8_head}")
+
     return base_cmd
 
 def main():

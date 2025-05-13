@@ -28,19 +28,24 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+from model_fp8 import GPTConfig, GPT
+from transformer_engine.common.recipe import Format, DelayedScaling
+import transformer_engine.pytorch as te
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 
 
+
 log_max_logits = False
 log_mean_logits = False
-log_adam_m_v = False
+log_adam_m_v = True
+last_linear_fp8 = False
 
+save_batch = False
 initial_seed = 1024
-out_dir = 'out' 
+out_dir = f'out'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -79,8 +84,8 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
-start_idx = 38000
+compile = False # use PyTorch 2.0 to compile the model to be faster
+start_idx = 1000
 ckpt_path = 'ckpt_1.pt'
 indices_path = ''
 
@@ -93,7 +98,6 @@ config = {k: globals()[k] for k in config_keys} # will be useful for logging
 
 
 import torch.nn.functional as F
-
 
 # various inits, derived attributes, I/O setup
 ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
@@ -126,7 +130,8 @@ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+fp8_format = Format.HYBRID
+fp8_recipe = DelayedScaling(fp8_format=fp8_format, amax_history_len=16, amax_compute_algo="max")
 
 def load_indices():
     with open(os.path.join(indices_path), 'r') as f:
@@ -136,10 +141,11 @@ def load_indices():
         chunks = [row[i:i + batch_size] for i in range(0, len(row), batch_size)]
         tmp_indices.extend(chunks)
     logged_indices = [tmp_indices[i] for i in range(len(tmp_indices)) if i%ddp_world_size==ddp_local_rank]
-    return logged_indices   
+    return logged_indices  
 
 logged_indices = load_indices()
 cur_indices_index = 0
+
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
@@ -180,9 +186,10 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, last_linear_fp8=last_linear_fp8) # start with model_args from command line
 
         
+print(f"Resuming training from {out_dir}")
 # resume training from a checkpoint.
 checkpoint = torch.load(ckpt_path, map_location=device)
 checkpoint_model_args = checkpoint['model_args']
@@ -190,7 +197,6 @@ checkpoint_model_args = checkpoint['model_args']
 # the rest of the attributes (e.g. dropout) can stay as desired from command line
 for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
     model_args[k] = checkpoint_model_args[k]
-
 # create the model
 gptconf = GPTConfig(**model_args)
 model = GPT(gptconf)
@@ -201,8 +207,7 @@ unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
     if k.startswith(unwanted_prefix):
         state_dict[k[len(unwanted_prefix):]] = state_dict.pop(k)
-
-model.load_state_dict(state_dict, strict=False)
+model.load_state_dict(state_dict)
 iter_num = checkpoint['iter_num']
 best_val_loss = checkpoint['best_val_loss']
 
@@ -212,8 +217,6 @@ if block_size < model.config.block_size:
     model_args['block_size'] = block_size # so that the checkpoint will have the right value
 model.to(device)
 
-# initialize a GradScaler. If enabled=False scaler is a no-op
-scaler = torch.cuda.amp.GradScaler(enabled=(dtype == 'float16'))
 
 # optimizer
 optimizer = model.configure_optimizers(weight_decay, learning_rate, (beta1, beta2), device_type)
@@ -230,21 +233,7 @@ if compile:
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
 
-# helps estimate an arbitrarily accurate loss over either split using many batches
-@torch.no_grad()
-def estimate_loss():
-    out = {}
-    model.eval()
-    for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
-        for k in range(eval_iters):
-            X, Y = get_batch(split)
-            with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
-    model.train()
-    return out
+
 
 # learning rate decay scheduler (cosine with warmup)
 def get_lr(it):
@@ -273,18 +262,19 @@ raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
 norm = 0
 
+from utils.entropy import entropy_hook
 
-# Extract r[G, t]
+
 if log_max_logits:
-    attn_layer_text = [0, len(raw_model.transformer.h)-1]
-    attn_logits_collected_layers = [raw_model.transformer.h[0], raw_model.transformer.h[-1]]
     # only log first layer
-    for layer in attn_logits_collected_layers:
-        layer.attn.log_max_logits = True
-        layer.attn.register_buffer("bias", torch.tril(torch.ones(gptconf.block_size, gptconf.block_size, device=device))
-                                            .view(1, 1, gptconf.block_size, gptconf.block_size))
+    raw_model.transformer.h[0].self_attention.core_attention.register_forward_hook(entropy_hook)
+
+# Extract r[G, t]   
 if log_adam_m_v:
     collected_layers = [raw_model.transformer.wte, raw_model.transformer.h[0], raw_model.transformer.h[1], raw_model.transformer.h[2], raw_model.transformer.h[3]]
+
+    m_values = {}
+    v_values = {}
     r_values = {}
 
 
@@ -297,7 +287,6 @@ while True:
     if iter_num == 0 and eval_only:
         break
     # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
         if ddp:
             # in DDP training we only need to sync gradients at the last micro step.
@@ -305,20 +294,18 @@ while True:
             # I really dislike that this bloats the code and forces us to repeat code
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
-        with ctx:
-            logits, loss = model(X, Y)
-            loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
+        with te.fp8_autocast(enabled=True, fp8_recipe=fp8_recipe):
+            with torch.autocast(device_type=device_type, dtype=ptdtype):
+                logits, loss = model(X, Y)
+                loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
+        loss.backward()
     # clip the gradient
     if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
+    optimizer.step()
     # flush the gradients as soon as we can, no need for this memory anymore
     optimizer.zero_grad(set_to_none=True)
 
@@ -326,8 +313,9 @@ while True:
     t1 = time.time()
     dt = t1 - t0
     t0 = t1
-
     if iter_num % log_interval == 0 and master_process:
+        # get loss as float. note: this is a CPU-GPU sync point
+        # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
         lossf = loss.item() * gradient_accumulation_steps
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
@@ -355,32 +343,27 @@ while True:
                         sampled_r = r[sampled_indices]
 
                         r_values[iter_num][layer].append(sampled_r.cpu().numpy())
+                # with open(f'{out_dir}/opt_state/r_values_iter_{iter_num}_layer__{layer_name}_seed_{initial_seed}.pkl', 'wb') as f:
+                #     pickle.dump(r_values[iter_num][layer], f)
                 r_values[iter_num][layer] = np.concatenate(r_values[iter_num][layer])
                 counts, bin_edges = np.histogram(r_values[iter_num][layer], bins=100)
                 histogram_figure_file = f'{out_dir}/opt_state/r_values_iter_{iter_num}_layer_{layer_name}_seed_{initial_seed}.npz'
                 np.savez(histogram_figure_file, counts=counts, bin_edges=bin_edges)
                         
+                                
         log_text = f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, grad norm {norm:.2f}, lr {lr:.4f}, mfu {running_mfu*100:.2f}%"
         if log_max_logits:
-            log_text += f', attention logits layer {' '.join(str(attn_layer_text))}'
-            log_text += f', max'
-            for attn_layer in attn_logits_collected_layers:
-                log_text += f', {attn_layer.attn.max_attention_logit.item():.2f}' 
-            log_text += f', min'
-            for attn_layer in attn_logits_collected_layers:
-                log_text += f', {attn_layer.attn.min_attention_logits.item():.2f}' 
-            log_text += f', mean'
-            for attn_layer in attn_logits_collected_layers:
-                log_text += f', {attn_layer.attn.mean_attention_logits.item():.2f}' 
-            log_text += f', entropy'
-            for attn_layer in attn_logits_collected_layers:
-                log_text += f', {attn_layer.attn.entropy.item():.2f}' 
-
+            log_text += f', max_attention_logit {raw_model.transformer.h[0].self_attention.core_attention.max_attention_logit.item():.2f}'
+            log_text += f', entropy {raw_model.transformer.h[0].self_attention.core_attention.entropy.item():.2f}'
         if log_mean_logits:
             log_text += f', mean output logits {logits.mean().item():.2f}'
-            log_text += f', min output logits {logits.min().item():.2f}'
-            log_text += f', max output logits {logits.max().item():.2f}'
-                    
+        log_lips_list = [
+            ("ln_1", 'self_attention.layernorm_qkv.layer_norm_lipschitz_constant'),
+            ("ln_2", 'layernorm_mlp.layer_norm_lipschitz_constant'),
+            ("attn.c_attn", 'self_attention.layernorm_qkv.attn_lipschitz_constant'),
+            ("mlp.c_fc", 'layernorm_mlp.lipschitz_constant1'),
+            ("mlp.c_proj", 'layernorm_mlp.lipschitz_constant1'),
+        ]
         print(log_text)
     iter_num += 1
     local_iter_num += 1
