@@ -17,7 +17,14 @@ python data/openwebtext/prepare.py
 All models and checkpoints have hosted in https://huggingface.co/zzwen/InstabilityZoo.
 
 ## Using InstabilityZoo
-Run the following command to resume training from a checkpoint. The output log and optimizer state will be saved in the out_dir directory.
+First, download the checkpoints and related files from Hugging Face. For example:
+```
+wget https://huggingface.co/zzwen/InstabilityZoo/resolve/main/checkpoints/ckpt_1.pt
+wget https://huggingface.co/zzwen/InstabilityZoo/resolve/main/indices/ckpt_1_indices.txt
+wget https://huggingface.co/zzwen/InstabilityZoo/resolve/main/metadata/ckpt_1.json
+```
+
+Then run the following command to resume training from a checkpoint. The output log and optimizer state will be saved in the out_dir directory.
 ```
 python reproduce_main.py \
   --checkpoint checkpoints/ckpt_1.pt \
