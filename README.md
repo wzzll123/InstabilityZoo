@@ -24,7 +24,7 @@ wget https://huggingface.co/zzwen/InstabilityZoo/resolve/main/indices/ckpt_1_ind
 wget https://huggingface.co/zzwen/InstabilityZoo/resolve/main/metadata/ckpt_1.json
 ```
 
-Then run the following command to resume training from a checkpoint. The output log and optimizer state will be saved in the out_dir directory.
+Then, run the following command to resume training from a checkpoint. The output log and optimizer state will be saved in the specified out_dir. Be sure to specify the number of GPUs with --nproc; currently, our program only supports single-machine setups.
 ```
 python reproduce_main.py \
   --checkpoint checkpoints/ckpt_1.pt \
@@ -32,5 +32,6 @@ python reproduce_main.py \
   --metadata metadata/ckpt_1.json \
   --start_idx 38000 \
   --end_idx 40000 \
-  --out_dir output/run1
+  --out_dir output/run1 \
+  --nproc 8
 ```
